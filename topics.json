@@ -1,0 +1,40 @@
+{
+  "menu_message_id": 73,
+  "rubrics": {
+    "work_remote": {
+      "title": "💼 Работа удалённая",
+      "thread_id": 48,
+      "count": 0
+    },
+    "work_offline": {
+      "title": "🏢 Офлайн-работа",
+      "thread_id": 49,
+      "count": 0
+    },
+    "services_offer": {
+      "title": "🛠 Услуги",
+      "thread_id": 50,
+      "count": 1
+    },
+    "housing_rent": {
+      "title": "🏠 Жильё",
+      "thread_id": 51,
+      "count": 1
+    },
+    "events": {
+      "title": "🎉 Мероприятия",
+      "thread_id": 52,
+      "count": 0
+    },
+    "dating": {
+      "title": "👋 Знакомства",
+      "thread_id": 53,
+      "count": 0
+    },
+    "other": {
+      "title": "📢 Разное",
+      "thread_id": 54,
+      "count": 0
+    }
+  }
+}
