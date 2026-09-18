@@ -18,6 +18,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
 )
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -26,7 +27,7 @@ ADMIN_ID = 580885320
 CHANNEL_ID = -1004471760987
 
 if not BOT_TOKEN:
-    raise SystemExit("Не найден BOT_TOKEN. Проверь файл .env")
+    raise SystemExit("Не найден BOT_TOKEN. Проверь переменные окружения")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -35,7 +36,10 @@ BOT_USERNAME = "gruzia_life_bot"
 PRIVATE_ONLY = F.chat.type == "private"
 
 
-TOPICS_FILE = Path(__file__).parent / "topics.json"
+# ============================================================
+# ХРАНИЛИЩЕ
+# ============================================================
+TOPICS_FILE = Path("/data/topics.json") if Path("/data").exists() else Path(__file__).parent / "topics.json"
 
 RUBRIC_DEFS = {
     "work_remote":    ("💼 Работа удалённая", "💼 Работа"),
@@ -58,7 +62,10 @@ def load_data() -> dict:
                 for k, v in old.items():
                     if isinstance(v, dict) and "thread_id" in v:
                         v.setdefault("count", 0)
+                        v.setdefault("messages", [])
                         data["rubrics"][k] = v
+            for r in data.get("rubrics", {}).values():
+                r.setdefault("messages", [])
             return data
         except Exception:
             return {"menu_message_id": None, "rubrics": {}}
@@ -66,6 +73,7 @@ def load_data() -> dict:
 
 
 def save_data(data: dict):
+    TOPICS_FILE.parent.mkdir(parents=True, exist_ok=True)
     TOPICS_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -117,7 +125,6 @@ class AdForm(StatesGroup):
 # КЛАВИАТУРЫ
 # ============================================================
 def dashboard_kb() -> InlineKeyboardMarkup:
-    """Меню рубрик в боте."""
     buttons = [
         [InlineKeyboardButton(text=title, callback_data=f"ad_start:{key}")]
         for key, (title, _) in RUBRIC_DEFS.items()
@@ -132,7 +139,7 @@ def cancel_kb() -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# ДАШБОРД В ГРУППЕ (закреплённое сообщение с кнопками-рубриками)
+# ДАШБОРД В ГРУППЕ
 # ============================================================
 def build_group_dashboard() -> tuple[str, InlineKeyboardMarkup]:
     data = load_data()
@@ -145,7 +152,7 @@ def build_group_dashboard() -> tuple[str, InlineKeyboardMarkup]:
     for key, (full_title, short_title) in RUBRIC_DEFS.items():
         topic = rubrics.get(key, {})
         thread_id = topic.get("thread_id")
-        count = topic.get("count", 0)
+        count = len(topic.get("messages", []))
 
         text = f"{short_title} ({count})"
 
@@ -158,7 +165,7 @@ def build_group_dashboard() -> tuple[str, InlineKeyboardMarkup]:
                 callback_data="noop",
             )])
 
-    total = sum(r.get("count", 0) for r in rubrics.values())
+    total = sum(len(r.get("messages", [])) for r in rubrics.values())
 
     text = (
         "📊 <b>Объявления по рубрикам</b>\n\n"
@@ -185,6 +192,9 @@ async def update_group_dashboard():
                 reply_markup=kb,
             )
             return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                return
         except Exception:
             pass
 
@@ -209,7 +219,7 @@ async def update_group_dashboard():
 
 
 # ============================================================
-# КОМАНДЫ
+# КОМАНДЫ БОТА
 # ============================================================
 async def set_commands():
     commands = [
@@ -251,6 +261,9 @@ async def cmd_myid(message: Message):
     )
 
 
+# ============================================================
+# АДМИН: настройка тем
+# ============================================================
 @dp.message(Command("setup_topics"), PRIVATE_ONLY)
 async def cmd_setup_topics(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -283,6 +296,7 @@ async def cmd_setup_topics(message: Message):
         existing = rubrics.get(key, {})
         if existing.get("thread_id"):
             existing.setdefault("count", 0)
+            existing.setdefault("messages", [])
             existing["title"] = full_title
             skipped.append(full_title)
             continue
@@ -296,6 +310,7 @@ async def cmd_setup_topics(message: Message):
                 "title": full_title,
                 "thread_id": result.message_thread_id,
                 "count": 0,
+                "messages": [],
             }
             created.append(f"{full_title} (id={result.message_thread_id})")
             await asyncio.sleep(2)
@@ -331,6 +346,187 @@ async def cmd_update_dashboard(message: Message):
         await message.answer("✅ Дашборд обновлён.")
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {e}")
+
+
+# ============================================================
+# АДМИН: пересчёт по факту
+# ============================================================
+@dp.message(Command("recount"), PRIVATE_ONLY)
+async def cmd_recount(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для админа.")
+        return
+
+    await message.answer("⏳ Пересчитываю…")
+
+    data = load_data()
+    rubrics = data.get("rubrics", {})
+    total_removed = 0
+    report = []
+
+    for key, (full_title, _) in RUBRIC_DEFS.items():
+        rubric = rubrics.get(key, {})
+        msgs = rubric.get("messages", [])
+        alive = []
+        removed_here = 0
+
+        for m in msgs:
+            mid = m.get("id")
+            username = m.get("user")
+            kb = None
+            if username:
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="✉️ Написать автору",
+                        url=f"https://t.me/{username}",
+                    )],
+                ])
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=CHANNEL_ID,
+                    message_id=mid,
+                    reply_markup=kb,
+                )
+                alive.append(m)
+            except TelegramBadRequest as e:
+                err = str(e).lower()
+                if "not modified" in err:
+                    alive.append(m)
+                elif "not found" in err or "message_id_invalid" in err:
+                    removed_here += 1
+                else:
+                    alive.append(m)
+            except Exception:
+                alive.append(m)
+            await asyncio.sleep(0.3)
+
+        rubric["messages"] = alive
+        rubric["count"] = len(alive)
+        total_removed += removed_here
+        report.append(f"{full_title}: {len(alive)} (удалено {removed_here})")
+
+    save_data(data)
+
+    try:
+        await update_group_dashboard()
+    except Exception:
+        pass
+
+    await message.answer(
+        "✅ <b>Пересчёт завершён.</b>\n\n"
+        + "\n".join(report)
+        + f"\n\n<b>Всего удалено:</b> {total_removed}",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# АДМИН: ручная правка
+# ============================================================
+@dp.message(Command("minus"), PRIVATE_ONLY)
+async def cmd_minus(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для админа.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        keys = ", ".join(RUBRIC_DEFS.keys())
+        await message.answer(
+            f"Использование: <code>/minus ключ</code>\n\n"
+            f"Ключи:\n{keys}",
+            parse_mode="HTML",
+        )
+        return
+
+    key = parts[1].strip()
+    if key not in RUBRIC_DEFS:
+        await message.answer(f"⚠️ Неизвестный ключ: {key}")
+        return
+
+    data = load_data()
+    rubrics = data.get("rubrics", {})
+    if key not in rubrics:
+        await message.answer(f"⚠️ Рубрика {key} не найдена.")
+        return
+
+    msgs = rubrics[key].get("messages", [])
+    if not msgs:
+        await message.answer("Рубрика уже пуста.")
+        return
+
+    msgs.pop()
+    rubrics[key]["count"] = len(msgs)
+    save_data(data)
+    await update_group_dashboard()
+    await message.answer(f"✅ {RUBRIC_DEFS[key][0]}: удалена 1 запись из счётчика.")
+
+
+@dp.message(Command("setcount"), PRIVATE_ONLY)
+async def cmd_setcount(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для админа.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer(
+            "Использование: <code>/setcount ключ число</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    key = parts[1].strip()
+    try:
+        value = int(parts[2])
+    except ValueError:
+        await message.answer("⚠️ Число должно быть целым.")
+        return
+
+    if key not in RUBRIC_DEFS:
+        await message.answer(f"⚠️ Неизвестный ключ: {key}")
+        return
+
+    data = load_data()
+    rubrics = data.setdefault("rubrics", {})
+    if key not in rubrics:
+        rubrics[key] = {
+            "title": RUBRIC_DEFS[key][0],
+            "thread_id": None,
+            "count": value,
+            "messages": [],
+        }
+    else:
+        rubrics[key]["count"] = value
+
+    save_data(data)
+    await update_group_dashboard()
+    await message.answer(f"✅ {RUBRIC_DEFS[key][0]}: установлено {value}.")
+
+
+@dp.message(Command("stats"), PRIVATE_ONLY)
+async def cmd_stats(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Только для админа.")
+        return
+
+    data = load_data()
+    rubrics = data.get("rubrics", {})
+
+    lines = ["📊 <b>Счётчики по рубрикам</b>\n"]
+    total = 0
+    for key, (title, _) in RUBRIC_DEFS.items():
+        count = len(rubrics.get(key, {}).get("messages", []))
+        total += count
+        lines.append(f"<code>{key}</code> — {title}: <b>{count}</b>")
+
+    lines.append(f"\n<b>Всего:</b> {total}")
+    lines.append("\n<b>Команды:</b>")
+    lines.append("/recount — пересчитать по факту (учесть удалённые)")
+    lines.append("/minus ключ — убрать 1 из счётчика")
+    lines.append("/setcount ключ число — установить точное")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "noop")
@@ -384,8 +580,6 @@ async def cb_ad_start(callback: CallbackQuery, state: FSMContext):
 # ============================================================
 @dp.message(AdForm.waiting_text, PRIVATE_ONLY)
 async def process_ad(message: Message, state: FSMContext):
-    from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
-
     data = await state.get_data()
     rubric_key = data.get("rubric_key")
     rubric_title = data.get("rubric_title", "📢 Объявление")
@@ -427,7 +621,7 @@ async def process_ad(message: Message, state: FSMContext):
     try:
         if message.photo:
             photo_file_id = message.photo[-1].file_id
-            await bot.send_photo(
+            sent = await bot.send_photo(
                 chat_id=CHANNEL_ID,
                 message_thread_id=thread_id,
                 photo=photo_file_id,
@@ -436,7 +630,7 @@ async def process_ad(message: Message, state: FSMContext):
                 reply_markup=contact_kb,
             )
         else:
-            await bot.send_message(
+            sent = await bot.send_message(
                 chat_id=CHANNEL_ID,
                 message_thread_id=thread_id,
                 text=full_text,
@@ -461,7 +655,14 @@ async def process_ad(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    rubrics[rubric_key]["count"] = rubrics[rubric_key].get("count", 0) + 1
+    # Сохраняем message_id и автора
+    if "messages" not in rubrics[rubric_key]:
+        rubrics[rubric_key]["messages"] = []
+    rubrics[rubric_key]["messages"].append({
+        "id": sent.message_id,
+        "user": user.username or "",
+    })
+    rubrics[rubric_key]["count"] = len(rubrics[rubric_key]["messages"])
     save_data(file_data)
 
     try:
